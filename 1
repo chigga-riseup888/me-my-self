@@ -1,0 +1,1580 @@
+#!/usr/bin/env python3
+"""
+通用动态库依赖关系分析工具（修正版）
+
+功能：
+1) 扫描目录下 ELF 可执行文件，识别直接/间接 DT_NEEDED 与强符号实际需求
+2) 分析库与库之间的实际符号依赖图，输出可达性、双向互依与循环依赖
+3) 给出库级冗余链接风险（DT_NEEDED 与强符号依赖对比）
+4) 支持单库分析、JSON 报告和 CI 非零退出码
+
+重要修正：
+- readelf 对部分嵌入式 ELF 会返回非零退出码，但 stdout 仍包含有效数据；本脚本不再仅依赖 returncode
+- 符号分析统一使用动态符号表：readelf -W -s -D
+- 扫描可执行文件不再依赖文件的宿主机执行权限位
+
+用法：
+  python3 analyze_lib_dependencies_fixed.py <目录路径> [--verbose] [--json-report <输出文件>] [--fail-on-unused]
+  python3 analyze_lib_dependencies_fixed.py <根目录路径> <库路径> [--json-report <输出文件>]
+
+示例：
+  python3 analyze_lib_dependencies_fixed.py /model/spec/filesystem/
+  python3 analyze_lib_dependencies_fixed.py /model/spec/filesystem/ --verbose
+  python3 analyze_lib_dependencies_fixed.py /model/spec/filesystem/ libcmm.so
+  python3 analyze_lib_dependencies_fixed.py /model/spec/filesystem/ --json-report out/report.json
+
+说明：
+- 本工具分析的是 ELF 静态链接与动态符号关系，不覆盖 dlopen/dlsym、配置驱动插件、运行时条件加载。
+- “未使用/不可达”只能作为裁剪候选，必须结合样机运行时 /proc/<pid>/maps、strace 和功能回归确认。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from collections import deque
+from datetime import datetime
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+
+REQUIRED_EXTERNAL_COMMANDS = ("readelf", "file")
+
+IGNORED_REPORT_SYMBOL_NAMES = {
+    ".data",
+    ".bss",
+    ".text",
+    ".init",
+    ".fini",
+    "_init",
+    "_fini",
+}
+IGNORED_REPORT_SYMBOL_TYPES = {"SECTION", "FILE"}
+
+_symbol_cache: Dict[str, List[str]] = {}
+_dependency_cache: Dict[str, List[str]] = {}
+_library_path_cache: Dict[Tuple[str, Tuple[str, ...]], Optional[str]] = {}
+_library_list_cache: Dict[str, List[str]] = {}
+_executable_list_cache: Dict[str, List[str]] = {}
+_file_output_cache: Dict[str, str] = {}
+_elf_type_cache: Dict[str, str] = {}
+_library_references: Dict[str, Dict[str, Set[str]]] = {}
+
+
+# -----------------------------------------------------------------------------
+# 基础工具
+# -----------------------------------------------------------------------------
+
+def clear_cache() -> None:
+    _symbol_cache.clear()
+    _dependency_cache.clear()
+    _library_path_cache.clear()
+    _library_list_cache.clear()
+    _executable_list_cache.clear()
+    _file_output_cache.clear()
+    _elf_type_cache.clear()
+    _library_references.clear()
+
+
+def check_required_commands() -> Tuple[bool, List[str]]:
+    missing = [cmd for cmd in REQUIRED_EXTERNAL_COMMANDS if shutil.which(cmd) is None]
+    return not missing, missing
+
+
+def run_command(command: Sequence[str], timeout: int = 10) -> Tuple[str, str, int]:
+    try:
+        result = subprocess.run(
+            list(command),
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+        )
+        return result.stdout or "", result.stderr or "", result.returncode
+    except (OSError, subprocess.SubprocessError):
+        return "", "", -1
+
+
+def run_readelf(arguments: Sequence[str], file_path: str, timeout: int = 10) -> str:
+    """
+    返回 readelf 的 stdout，不以退出码作为唯一成功标准。
+
+    某些嵌入式产物的 section header 被裁剪或存在异常，readelf 会向 stderr
+    输出 warning/error 并返回非零，但 stdout 中的 PT_DYNAMIC、DT_NEEDED 或
+    动态符号表仍然完整可用。
+    """
+    stdout, _, _ = run_command(["readelf", *arguments, file_path], timeout=timeout)
+    return stdout
+
+
+def get_file_output(path: str) -> str:
+    if path in _file_output_cache:
+        return _file_output_cache[path]
+    stdout, _, _ = run_command(["file", "-b", path], timeout=5)
+    _file_output_cache[path] = stdout.strip()
+    return _file_output_cache[path]
+
+
+def is_elf_file(path: str) -> bool:
+    try:
+        with open(path, "rb") as stream:
+            return stream.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def get_elf_type(path: str) -> str:
+    if path in _elf_type_cache:
+        return _elf_type_cache[path]
+
+    output = run_readelf(["-W", "-h"], path)
+    elf_type = ""
+    for line in output.splitlines():
+        match = re.match(r"\s*Type:\s+(\S+)", line)
+        if match:
+            elf_type = match.group(1)
+            break
+    _elf_type_cache[path] = elf_type
+    return elf_type
+
+
+def dereference_symlink(path: str) -> str:
+    try:
+        return os.path.realpath(path)
+    except OSError:
+        return path
+
+
+def is_shared_library_filename(name: str) -> bool:
+    return name.endswith(".so") or ".so." in name
+
+
+def get_library_family_name(name: str) -> str:
+    if ".so." in name:
+        return name.split(".so.", 1)[0] + ".so"
+    return name
+
+
+def canonical_library_name(path_or_name: str) -> str:
+    path = path_or_name
+    if os.path.lexists(path):
+        return os.path.basename(dereference_symlink(path))
+    return os.path.basename(path_or_name)
+
+
+def deduplicate_preserve_order(items: Iterable[str]) -> List[str]:
+    return list(dict.fromkeys(items))
+
+
+def write_json_report(report_data: dict, output_path: str) -> Tuple[bool, str]:
+    try:
+        output_path = os.path.abspath(output_path)
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as stream:
+            json.dump(report_data, stream, ensure_ascii=False, indent=2)
+        return True, output_path
+    except (OSError, TypeError, ValueError) as exc:
+        return False, str(exc)
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+
+def print_usage() -> None:
+    print("用法1: python3 analyze_lib_dependencies_fixed.py <目录路径> [--verbose] [--json-report <输出文件>] [--fail-on-unused]")
+    print("      扫描目录内 ELF 可执行文件和共享库")
+    print("\n用法2: python3 analyze_lib_dependencies_fixed.py <根目录路径> <库路径> [--json-report <输出文件>]")
+    print("      分析单个共享库")
+
+
+def parse_cli_arguments(argv: Sequence[str]) -> dict:
+    verbose = False
+    json_report_path: Optional[str] = None
+    fail_on_unused = False
+    positional: List[str] = []
+
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg in ("-h", "--help"):
+            return {"show_help": True}
+        if arg == "--verbose":
+            verbose = True
+        elif arg == "--fail-on-unused":
+            fail_on_unused = True
+        elif arg == "--json-report":
+            if index + 1 >= len(argv):
+                raise ValueError("--json-report 需要指定输出文件")
+            json_report_path = argv[index + 1]
+            index += 1
+        else:
+            positional.append(arg)
+        index += 1
+
+    if not positional:
+        return {"show_help": True}
+    if len(positional) == 1:
+        return {
+            "show_help": False,
+            "mode": "scan",
+            "directory_path": positional[0],
+            "verbose": verbose,
+            "json_report_path": json_report_path,
+            "fail_on_unused": fail_on_unused,
+        }
+    if len(positional) == 2:
+        return {
+            "show_help": False,
+            "mode": "single",
+            "root_dir": positional[0],
+            "lib_path": positional[1],
+            "verbose": verbose,
+            "json_report_path": json_report_path,
+            "fail_on_unused": fail_on_unused,
+        }
+    raise ValueError("参数过多")
+
+
+# -----------------------------------------------------------------------------
+# ELF 文件扫描与库定位
+# -----------------------------------------------------------------------------
+
+def find_all_libraries_in_path(search_path: str) -> List[str]:
+    search_path = os.path.abspath(search_path)
+    if search_path in _library_list_cache:
+        return _library_list_cache[search_path]
+
+    libraries: List[str] = []
+    if not os.path.isdir(search_path):
+        _library_list_cache[search_path] = libraries
+        return libraries
+
+    for root, dirs, files in os.walk(search_path):
+        dirs.sort()
+        files.sort()
+        for name in files:
+            if not is_shared_library_filename(name):
+                continue
+            full_path = os.path.join(root, name)
+            if is_elf_file(dereference_symlink(full_path)):
+                libraries.append(full_path)
+
+    _library_list_cache[search_path] = libraries
+    return libraries
+
+
+def looks_like_executable(path: str) -> bool:
+    """不依赖宿主机权限位识别目标 rootfs 中的 ELF 可执行文件。"""
+    if not is_elf_file(path):
+        return False
+    if is_shared_library_filename(os.path.basename(path)):
+        return False
+
+    file_output = get_file_output(path).lower()
+    if "pie executable" in file_output or " executable" in file_output:
+        return True
+
+    elf_type = get_elf_type(path)
+    if elf_type == "EXEC":
+        return True
+
+    # PIE 通常是 ET_DYN，存在 PT_INTERP 时可视为可执行文件。
+    if elf_type == "DYN":
+        program_headers = run_readelf(["-W", "-l"], path)
+        if re.search(r"\bINTERP\b", program_headers):
+            return True
+
+    return False
+
+
+def find_all_executables_in_path(search_path: str) -> List[str]:
+    search_path = os.path.abspath(search_path)
+    if search_path in _executable_list_cache:
+        return _executable_list_cache[search_path]
+
+    executables: List[str] = []
+    if not os.path.isdir(search_path):
+        _executable_list_cache[search_path] = executables
+        return executables
+
+    for root, dirs, files in os.walk(search_path):
+        dirs.sort()
+        files.sort()
+        for name in files:
+            full_path = os.path.join(root, name)
+            if os.path.islink(full_path):
+                continue
+            if looks_like_executable(full_path):
+                executables.append(full_path)
+
+    _executable_list_cache[search_path] = executables
+    return executables
+
+
+def build_library_index(search_paths: Sequence[str]) -> Dict[str, List[str]]:
+    index: Dict[str, List[str]] = {}
+    seen_real_paths: Set[str] = set()
+
+    for search_path in search_paths:
+        for path in find_all_libraries_in_path(search_path):
+            real_path = dereference_symlink(path)
+            if not is_elf_file(real_path):
+                continue
+
+            # 允许不同名字映射到同一真实文件，但避免重复加入同一路径。
+            names = {os.path.basename(path), os.path.basename(real_path)}
+            soname = get_soname(real_path)
+            if soname:
+                names.add(soname)
+
+            for name in names:
+                paths = index.setdefault(name, [])
+                if real_path not in paths:
+                    paths.append(real_path)
+            seen_real_paths.add(real_path)
+
+    for paths in index.values():
+        paths.sort()
+    return index
+
+
+def find_library_file(file_name: str, search_paths: Sequence[str], library_index: Optional[Dict[str, List[str]]] = None) -> Optional[str]:
+    if os.path.isfile(file_name):
+        return dereference_symlink(file_name)
+
+    key = (file_name, tuple(os.path.abspath(path) for path in search_paths))
+    if key in _library_path_cache:
+        return _library_path_cache[key]
+
+    if library_index is None:
+        library_index = build_library_index(search_paths)
+
+    candidates = library_index.get(os.path.basename(file_name), [])
+    result = candidates[0] if candidates else None
+    _library_path_cache[key] = result
+    return result
+
+
+# -----------------------------------------------------------------------------
+# 动态段与符号表解析
+# -----------------------------------------------------------------------------
+
+def get_soname(path: str) -> Optional[str]:
+    output = run_readelf(["-W", "-d"], path)
+    for line in output.splitlines():
+        match = re.search(r"\(SONAME\).*?\[(.+?)\]", line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def get_library_dependencies(path: str) -> List[str]:
+    real_path = dereference_symlink(path)
+    if real_path in _dependency_cache:
+        return _dependency_cache[real_path]
+
+    dependencies: List[str] = []
+    output = run_readelf(["-W", "-d"], real_path)
+    for line in output.splitlines():
+        if "(NEEDED)" not in line:
+            continue
+        match = re.search(r"\(NEEDED\).*?\[(.+?)\]", line)
+        if match:
+            dependencies.append(match.group(1))
+
+    dependencies = deduplicate_preserve_order(dependencies)
+    _dependency_cache[real_path] = dependencies
+    return dependencies
+
+
+def parse_dynamic_symbol_lines(path: str) -> List[dict]:
+    """解析 readelf -W -s -D 输出。"""
+    output = run_readelf(["-W", "-s", "-D"], dereference_symlink(path))
+    symbols: List[dict] = []
+
+    # Num: Value Size Type Bind Vis Ndx Name
+    pattern = re.compile(
+        r"^\s*(\d+):\s+"
+        r"(\S+)\s+"      # Value
+        r"(\S+)\s+"      # Size
+        r"(\S+)\s+"      # Type
+        r"(\S+)\s+"      # Bind
+        r"(\S+)\s+"      # Vis
+        r"(\S+)\s+"      # Ndx
+        r"(.+?)\s*$"       # Name
+    )
+
+    for line in output.splitlines():
+        match = pattern.match(line)
+        if not match:
+            continue
+
+        raw_name = match.group(8).strip()
+        if not raw_name:
+            continue
+
+        # readelf 可能在版本化名称后附加版本索引，例如 foo@VER (2)。
+        name = re.sub(r"\s+\(\d+\)$", "", raw_name)
+        if name == "UND" or name.startswith("*"):
+            continue
+
+        symbols.append({
+            "num": int(match.group(1)),
+            "value": match.group(2),
+            "size": match.group(3),
+            "type": match.group(4),
+            "bind": match.group(5),
+            "vis": match.group(6),
+            "ndx": match.group(7),
+            "name": name,
+        })
+
+    return symbols
+
+
+def format_symbol_entry(name: str, symbol_type: str) -> str:
+    return f"{name} ({symbol_type})" if symbol_type else name
+
+
+def parse_symbol_entry_type(raw_symbol: str) -> Optional[str]:
+    match = re.search(r"\(([^()]+)\)\s*$", raw_symbol or "")
+    return match.group(1) if match else None
+
+
+def parse_symbol_identity(raw_symbol: str) -> dict:
+    symbol_full = raw_symbol.split(" (")[0] if " (" in raw_symbol else raw_symbol
+    symbol_name = symbol_full.split("@", 1)[0]
+    has_version = "@" in symbol_full
+    version = symbol_full.split("@", 1)[1].lstrip("@") if has_version else None
+    return {
+        "name": symbol_name,
+        "has_version": has_version,
+        "version": version,
+        "full": symbol_full,
+    }
+
+
+def should_ignore_symbol_for_report(raw_symbol: str) -> bool:
+    if not raw_symbol:
+        return True
+    symbol_info = parse_symbol_identity(raw_symbol)
+    name = symbol_info.get("name")
+    if not name or name in IGNORED_REPORT_SYMBOL_NAMES or name.startswith("."):
+        return True
+    return parse_symbol_entry_type(raw_symbol) in IGNORED_REPORT_SYMBOL_TYPES
+
+
+def get_undefined_symbol_groups(path: str) -> dict:
+    required: List[str] = []
+    weak: List[str] = []
+
+    for symbol in parse_dynamic_symbol_lines(path):
+        if symbol["ndx"] != "UND":
+            continue
+        entry = format_symbol_entry(symbol["name"], symbol["type"])
+        if symbol["bind"] == "WEAK":
+            weak.append(entry)
+        else:
+            required.append(entry)
+
+    required.extend(get_copy_relocation_symbols(path))
+    return {
+        "required": deduplicate_preserve_order(required),
+        "weak": deduplicate_preserve_order(weak),
+    }
+
+
+def get_undefined_symbols(path: str, include_weak: bool = False) -> List[str]:
+    groups = get_undefined_symbol_groups(path)
+    if include_weak:
+        return deduplicate_preserve_order(groups["required"] + groups["weak"])
+    return groups["required"]
+
+
+def get_exported_symbols(path: str) -> List[str]:
+    real_path = dereference_symlink(path)
+    if real_path in _symbol_cache:
+        return _symbol_cache[real_path]
+
+    exported: List[str] = []
+    for symbol in parse_dynamic_symbol_lines(real_path):
+        if symbol["ndx"] in ("", "UND"):
+            continue
+        if symbol["bind"] not in ("GLOBAL", "WEAK"):
+            continue
+        if symbol["vis"] not in ("DEFAULT", "PROTECTED"):
+            continue
+
+        entry = format_symbol_entry(symbol["name"], symbol["type"])
+        if should_ignore_symbol_for_report(entry):
+            continue
+        exported.append(entry)
+
+    exported = deduplicate_preserve_order(exported)
+    _symbol_cache[real_path] = exported
+    return exported
+
+
+def get_copy_relocation_symbols(path: str) -> List[str]:
+    output = run_readelf(["-W", "-r"], dereference_symlink(path))
+    symbols: List[str] = []
+    for line in output.splitlines():
+        if not re.search(r"\bR_[A-Z0-9_]+_COPY\b|\bCOPY\b", line):
+            continue
+        match = re.search(r"\b([A-Za-z_][A-Za-z0-9_.$]*(?:@{1,2}[A-Za-z0-9_.-]+)?)\s*(?:\+\s*\d+)?\s*$", line)
+        if match:
+            symbols.append(format_symbol_entry(match.group(1), "COPY RELOC"))
+    return deduplicate_preserve_order(symbols)
+
+
+def build_library_symbol_index(exported_symbols: Iterable[str]) -> Dict[str, List[dict]]:
+    index: Dict[str, List[dict]] = {}
+    for exported in exported_symbols:
+        identity = parse_symbol_identity(exported)
+        index.setdefault(identity["name"], []).append(identity)
+    return index
+
+
+def symbol_version_matches(undefined: dict, exported: dict) -> bool:
+    if not undefined["has_version"]:
+        return True
+    if not exported["has_version"]:
+        return False
+    return undefined["version"] == exported["version"]
+
+
+def symbol_matches_any_export(undefined: dict, candidates: Iterable[dict]) -> bool:
+    return any(symbol_version_matches(undefined, candidate) for candidate in candidates)
+
+
+# -----------------------------------------------------------------------------
+# 符号提供者与依赖图
+# -----------------------------------------------------------------------------
+
+def record_library_reference(lib_name: str, referrer_path: str, is_executable: bool) -> None:
+    entry = _library_references.setdefault(lib_name, {"executables": set(), "libraries": set()})
+    key = "executables" if is_executable else "libraries"
+    entry[key].add(os.path.basename(referrer_path))
+
+
+def normalize_library_name(lib_name: str, search_paths: Sequence[str], library_index: Dict[str, List[str]]) -> str:
+    path = find_library_file(lib_name, search_paths, library_index)
+    return canonical_library_name(path) if path else lib_name
+
+
+def ordered_library_candidates(
+    preferred_names: Sequence[str],
+    search_paths: Sequence[str],
+    library_index: Dict[str, List[str]],
+    include_all: bool,
+) -> List[Tuple[str, str]]:
+    result: List[Tuple[str, str]] = []
+    seen_paths: Set[str] = set()
+
+    for name in preferred_names:
+        path = find_library_file(name, search_paths, library_index)
+        if path and path not in seen_paths:
+            result.append((name, path))
+            seen_paths.add(path)
+
+    if include_all:
+        all_paths = sorted({path for paths in library_index.values() for path in paths})
+        for path in all_paths:
+            if path in seen_paths:
+                continue
+            result.append((get_soname(path) or os.path.basename(path), path))
+            seen_paths.add(path)
+
+    return result
+
+
+def resolve_symbol_providers(
+    undefined_symbols: Sequence[str],
+    preferred_library_names: Sequence[str],
+    search_paths: Sequence[str],
+    library_index: Dict[str, List[str]],
+    include_all_fallback: bool = True,
+) -> Tuple[Dict[str, List[str]], List[str]]:
+    providers: Dict[str, List[str]] = {}
+    missing: Dict[str, dict] = {
+        raw: parse_symbol_identity(raw) for raw in undefined_symbols
+    }
+
+    for display_name, path in ordered_library_candidates(
+        preferred_library_names,
+        search_paths,
+        library_index,
+        include_all_fallback,
+    ):
+        if not missing:
+            break
+
+        exported_index = build_library_symbol_index(get_exported_symbols(path))
+        found: List[str] = []
+        for raw_symbol, identity in missing.items():
+            candidates = exported_index.get(identity["name"], [])
+            if candidates and symbol_matches_any_export(identity, candidates):
+                found.append(raw_symbol)
+
+        provider_name = get_soname(path) or display_name or os.path.basename(path)
+        for raw_symbol in found:
+            providers.setdefault(raw_symbol, []).append(provider_name)
+            missing.pop(raw_symbol, None)
+
+    return providers, list(missing.keys())
+
+
+def actual_dependencies_for_consumer(
+    consumer_path: str,
+    search_paths: Sequence[str],
+    library_index: Dict[str, List[str]],
+    top_level_deps: Optional[Sequence[str]] = None,
+    record_references: bool = True,
+    is_executable: bool = False,
+) -> dict:
+    needed = get_library_dependencies(consumer_path)
+    preferred = deduplicate_preserve_order(list(top_level_deps or []) + needed)
+    undefined = get_undefined_symbols(consumer_path)
+
+    providers, missing = resolve_symbol_providers(
+        undefined,
+        preferred,
+        search_paths,
+        library_index,
+        include_all_fallback=True,
+    )
+
+    direct_actual: Set[str] = set()
+    for provider_names in providers.values():
+        for provider in provider_names:
+            normalized = normalize_library_name(provider, search_paths, library_index)
+            direct_actual.add(normalized)
+            if record_references:
+                record_library_reference(normalized, consumer_path, is_executable=is_executable)
+
+    return {
+        "undefined_symbols": undefined,
+        "symbol_providers": providers,
+        "missing_symbols": missing,
+        "direct_actual_dependencies": sorted(direct_actual),
+    }
+
+
+def build_needed_closure(
+    root_libraries: Iterable[str],
+    search_paths: Sequence[str],
+    library_index: Dict[str, List[str]],
+) -> Tuple[Set[str], Dict[str, Set[str]]]:
+    closure: Set[str] = set()
+    introducers: Dict[str, Set[str]] = {}
+    queue: deque[str] = deque()
+
+    for raw in root_libraries:
+        normalized = normalize_library_name(raw, search_paths, library_index)
+        path = find_library_file(raw, search_paths, library_index) or find_library_file(normalized, search_paths, library_index)
+        if path and normalized not in closure:
+            closure.add(normalized)
+            queue.append(normalized)
+
+    visited: Set[str] = set()
+    while queue:
+        current = queue.popleft()
+        if current in visited:
+            continue
+        visited.add(current)
+
+        path = find_library_file(current, search_paths, library_index)
+        if not path:
+            continue
+
+        for dep in get_library_dependencies(path):
+            dep_path = find_library_file(dep, search_paths, library_index)
+            if not dep_path:
+                continue
+            normalized = canonical_library_name(dep_path)
+            introducers.setdefault(normalized, set()).add(current)
+            if normalized not in closure:
+                closure.add(normalized)
+                queue.append(normalized)
+
+    return closure, introducers
+
+
+def build_actual_closure(
+    root_libraries: Iterable[str],
+    search_paths: Sequence[str],
+    library_index: Dict[str, List[str]],
+    executable_name: Optional[str] = None,
+    resolution_records: Optional[List[dict]] = None,
+) -> Set[str]:
+    closure: Set[str] = set()
+    queue: deque[str] = deque()
+
+    for raw in root_libraries:
+        normalized = normalize_library_name(raw, search_paths, library_index)
+        if find_library_file(raw, search_paths, library_index) or find_library_file(normalized, search_paths, library_index):
+            queue.append(normalized)
+
+    visited: Set[str] = set()
+    while queue:
+        current = queue.popleft()
+        if current in visited:
+            continue
+        visited.add(current)
+
+        path = find_library_file(current, search_paths, library_index)
+        if not path:
+            continue
+
+        analysis = actual_dependencies_for_consumer(
+            path,
+            search_paths,
+            library_index,
+            top_level_deps=get_library_dependencies(path),
+            record_references=True,
+            is_executable=False,
+        )
+
+        if resolution_records is not None and executable_name:
+            for raw_symbol, providers in analysis["symbol_providers"].items():
+                normalized_providers = sorted({
+                    normalize_library_name(provider, search_paths, library_index)
+                    for provider in providers
+                })
+                if normalized_providers:
+                    identity = parse_symbol_identity(raw_symbol)
+                    resolution_records.append({
+                        "executable": executable_name,
+                        "consumer_type": "library",
+                        "consumer": current,
+                        "symbol": identity["name"],
+                        "symbol_raw": raw_symbol,
+                        "selected_provider": normalized_providers[0],
+                        "provider_candidates": normalized_providers,
+                    })
+
+        for dep in analysis["direct_actual_dependencies"]:
+            if dep not in closure:
+                closure.add(dep)
+                queue.append(dep)
+
+    return closure
+
+
+# -----------------------------------------------------------------------------
+# 可执行文件分析
+# -----------------------------------------------------------------------------
+
+def analyze_executable(
+    executable_path: str,
+    search_paths: Sequence[str],
+    library_index: Dict[str, List[str]],
+    verbose: bool = False,
+) -> dict:
+    result = {
+        "readelf_direct_libraries": [],
+        "direct_needed_libraries": [],
+        "indirect_needed_libraries": [],
+        "loaded_needed_libraries": [],
+        "actual_required_libraries": [],
+        "direct_unused_libs": [],
+        "indirect_unused_libs": [],
+        "indirect_unused_introducers": {},
+        "unused_libs": [],
+        "symbol_provider_map": {},
+        "symbol_resolution_records": [],
+        "missing_symbols": [],
+    }
+
+    readelf_deps = get_library_dependencies(executable_path)
+    result["readelf_direct_libraries"] = sorted(set(readelf_deps))
+    if not readelf_deps:
+        return result
+
+    direct_analysis = actual_dependencies_for_consumer(
+        executable_path,
+        search_paths,
+        library_index,
+        top_level_deps=readelf_deps,
+        record_references=True,
+        is_executable=True,
+    )
+
+    executable_name = os.path.basename(executable_path)
+    direct_actual = set(direct_analysis["direct_actual_dependencies"])
+    result["missing_symbols"] = sorted(direct_analysis["missing_symbols"])
+
+    for raw_symbol, providers in sorted(direct_analysis["symbol_providers"].items()):
+        normalized_providers = sorted({
+            normalize_library_name(provider, search_paths, library_index)
+            for provider in providers
+        })
+        result["symbol_provider_map"][raw_symbol] = normalized_providers
+        if normalized_providers:
+            identity = parse_symbol_identity(raw_symbol)
+            result["symbol_resolution_records"].append({
+                "executable": executable_name,
+                "consumer_type": "executable",
+                "consumer": executable_name,
+                "symbol": identity["name"],
+                "symbol_raw": raw_symbol,
+                "selected_provider": normalized_providers[0],
+                "provider_candidates": normalized_providers,
+            })
+
+    indirect_actual = build_actual_closure(
+        direct_actual,
+        search_paths,
+        library_index,
+        executable_name=executable_name,
+        resolution_records=result["symbol_resolution_records"],
+    ) - direct_actual
+
+    actual_required = direct_actual | indirect_actual
+
+    direct_needed = {
+        normalize_library_name(dep, search_paths, library_index)
+        for dep in readelf_deps
+        if find_library_file(dep, search_paths, library_index)
+    }
+    needed_closure, introducers = build_needed_closure(direct_needed, search_paths, library_index)
+    indirect_needed = needed_closure - direct_needed
+
+    direct_unused = direct_needed - actual_required
+    indirect_unused = indirect_needed - actual_required
+    unused = direct_unused | indirect_unused
+
+    result.update({
+        "direct_needed_libraries": sorted(direct_needed),
+        "indirect_needed_libraries": sorted(indirect_needed),
+        "loaded_needed_libraries": sorted(needed_closure),
+        "actual_required_libraries": sorted(actual_required),
+        "direct_unused_libs": sorted(direct_unused),
+        "indirect_unused_libs": sorted(indirect_unused),
+        "indirect_unused_introducers": {
+            name: sorted(introducers.get(name, set())) for name in sorted(indirect_unused)
+        },
+        "unused_libs": sorted(unused),
+    })
+
+    if verbose:
+        print(f"\n分析可执行文件: {executable_name}")
+        print(f"  DT_NEEDED: {len(direct_needed)}")
+        print(f"  动态强符号: {len(direct_analysis['undefined_symbols'])}")
+        print(f"  已解析符号: {len(direct_analysis['symbol_providers'])}")
+        print(f"  未解析符号: {len(direct_analysis['missing_symbols'])}")
+        print(f"  实际所需库: {len(actual_required)}")
+        print(f"  未使用候选: {len(unused)}")
+
+    return result
+
+
+# -----------------------------------------------------------------------------
+# 全局报告
+# -----------------------------------------------------------------------------
+
+def get_library_reference_stats(all_library_paths: Sequence[str]) -> dict:
+    discovered = {canonical_library_name(path) for path in all_library_paths}
+    merged: Dict[str, Dict[str, Set[str]]] = {
+        name: {"executables": set(), "libraries": set()} for name in discovered
+    }
+
+    for name, refs in _library_references.items():
+        entry = merged.setdefault(name, {"executables": set(), "libraries": set()})
+        entry["executables"].update(refs.get("executables", set()))
+        entry["libraries"].update(refs.get("libraries", set()))
+
+    libraries = []
+    for name, refs in sorted(
+        merged.items(),
+        key=lambda item: (-(len(item[1]["executables"]) + len(item[1]["libraries"])), item[0]),
+    ):
+        libraries.append({
+            "library": name,
+            "total_ref_count": len(refs["executables"]) + len(refs["libraries"]),
+            "executables": sorted(refs["executables"]),
+            "libraries": sorted(refs["libraries"]),
+        })
+
+    unreferenced = sorted(
+        name for name, refs in merged.items()
+        if not refs["executables"] and not refs["libraries"]
+    )
+
+    return {
+        "discovered_library_count": len(discovered),
+        "discovered_unreferenced_library_count": len(unreferenced),
+        "discovered_unreferenced_libraries": unreferenced,
+        "tracked_library_count": sum(1 for item in libraries if item["total_ref_count"] > 0),
+        "total_reference_count": sum(item["total_ref_count"] for item in libraries),
+        "libraries_with_executable_refs": sum(1 for item in libraries if item["executables"]),
+        "libraries_with_library_refs": sum(1 for item in libraries if item["libraries"]),
+        "libraries_with_executable_only_refs": sum(1 for item in libraries if item["executables"] and not item["libraries"]),
+        "libraries_with_library_only_refs": sum(1 for item in libraries if item["libraries"] and not item["executables"]),
+        "libraries_with_both_refs": sum(1 for item in libraries if item["executables"] and item["libraries"]),
+        "unreferenced_library_count": len(unreferenced),
+        "unreferenced_libraries": unreferenced,
+        "libraries": libraries,
+    }
+
+
+def strongly_connected_components(graph: Dict[str, Set[str]]) -> List[List[str]]:
+    index = 0
+    stack: List[str] = []
+    on_stack: Set[str] = set()
+    indices: Dict[str, int] = {}
+    lowlink: Dict[str, int] = {}
+    components: List[List[str]] = []
+
+    def strongconnect(node: str) -> None:
+        nonlocal index
+        indices[node] = index
+        lowlink[node] = index
+        index += 1
+        stack.append(node)
+        on_stack.add(node)
+
+        for neighbor in sorted(graph.get(node, set())):
+            if neighbor not in indices:
+                strongconnect(neighbor)
+                lowlink[node] = min(lowlink[node], lowlink[neighbor])
+            elif neighbor in on_stack:
+                lowlink[node] = min(lowlink[node], indices[neighbor])
+
+        if lowlink[node] == indices[node]:
+            component: List[str] = []
+            while True:
+                popped = stack.pop()
+                on_stack.remove(popped)
+                component.append(popped)
+                if popped == node:
+                    break
+            components.append(component)
+
+    for node in sorted(graph):
+        if node not in indices:
+            strongconnect(node)
+    return components
+
+
+def build_library_dependency_report(
+    executables: Sequence[str],
+    all_library_paths: Sequence[str],
+    search_paths: Sequence[str],
+    library_index: Dict[str, List[str]],
+) -> dict:
+    canonical_to_path: Dict[str, str] = {}
+    for path in all_library_paths:
+        canonical_to_path.setdefault(canonical_library_name(path), dereference_symlink(path))
+
+    nodes = set(canonical_to_path)
+    actual_edges: Dict[str, Set[str]] = {node: set() for node in nodes}
+    needed_edges: Dict[str, Set[str]] = {node: set() for node in nodes}
+    reverse_edges: Dict[str, Set[str]] = {node: set() for node in nodes}
+    external_actual: Dict[str, Set[str]] = {node: set() for node in nodes}
+    external_needed: Dict[str, Set[str]] = {node: set() for node in nodes}
+
+    for name, path in canonical_to_path.items():
+        for dep in get_library_dependencies(path):
+            dep_path = find_library_file(dep, search_paths, library_index)
+            if dep_path:
+                dep_name = canonical_library_name(dep_path)
+                if dep_name in nodes:
+                    needed_edges[name].add(dep_name)
+                else:
+                    external_needed[name].add(dep)
+            else:
+                external_needed[name].add(dep)
+
+        analysis = actual_dependencies_for_consumer(
+            path,
+            search_paths,
+            library_index,
+            top_level_deps=get_library_dependencies(path),
+            record_references=False,
+            is_executable=False,
+        )
+        for dep in analysis["direct_actual_dependencies"]:
+            if dep in nodes:
+                actual_edges[name].add(dep)
+                reverse_edges[dep].add(name)
+            else:
+                external_actual[name].add(dep)
+
+    executable_roots: Set[str] = set()
+    for executable in executables:
+        for dep in get_library_dependencies(executable):
+            dep_path = find_library_file(dep, search_paths, library_index)
+            if dep_path:
+                name = canonical_library_name(dep_path)
+                if name in nodes:
+                    executable_roots.add(name)
+
+    reachable = set(executable_roots)
+    stack = list(executable_roots)
+    while stack:
+        current = stack.pop()
+        for dep in actual_edges.get(current, set()):
+            if dep not in reachable:
+                reachable.add(dep)
+                stack.append(dep)
+
+    unreachable = sorted(nodes - reachable)
+
+    mutual_pairs = []
+    for left in sorted(nodes):
+        for right in sorted(actual_edges[left]):
+            if left < right and left in actual_edges.get(right, set()):
+                mutual_pairs.append({
+                    "libraries": [left, right],
+                    "reachable_members": sorted({left, right} & reachable),
+                    "unreachable_members": sorted({left, right} - reachable),
+                    "edges": [f"{left} -> {right}", f"{right} -> {left}"],
+                })
+
+    cycles = []
+    for component in strongly_connected_components(actual_edges):
+        members = sorted(component)
+        if len(members) == 1 and members[0] not in actual_edges[members[0]]:
+            continue
+        internal_edges = [
+            f"{src} -> {dst}"
+            for src in members
+            for dst in sorted(actual_edges[src])
+            if dst in members
+        ]
+        cycles.append({
+            "libraries": members,
+            "reachable_members": sorted(set(members) & reachable),
+            "unreachable_members": sorted(set(members) - reachable),
+            "internal_edges": internal_edges,
+            "cycle_type": "self-loop" if len(members) == 1 else ("bidirectional" if len(members) == 2 else "multi-node"),
+        })
+
+    families: Dict[str, List[str]] = {}
+    for name in sorted(nodes):
+        families.setdefault(get_library_family_name(name), []).append(name)
+    mixed_families = []
+    for family, members in sorted(families.items()):
+        reachable_members = sorted(set(members) & reachable)
+        unreachable_members = sorted(set(members) - reachable)
+        if reachable_members and unreachable_members:
+            mixed_families.append({
+                "family": family,
+                "reachable_members": reachable_members,
+                "unreachable_members": unreachable_members,
+            })
+
+    libraries = []
+    for name in sorted(nodes):
+        libraries.append({
+            "library": name,
+            "reachable_from_executables": name in reachable,
+            "depends_on_internal": sorted(actual_edges[name]),
+            "depends_on_external": sorted(external_actual[name]),
+            "depended_by_internal": sorted(reverse_edges[name]),
+            "needed_depends_on_internal": sorted(needed_edges[name]),
+            "needed_depends_on_external": sorted(external_needed[name]),
+        })
+
+    return {
+        "discovered_library_count": len(nodes),
+        "dependency_edge_count": sum(len(value) for value in actual_edges.values()),
+        "needed_dependency_edge_count": sum(len(value) for value in needed_edges.values()),
+        "library_family_count": len(families),
+        "mixed_reachability_family_count": len(mixed_families),
+        "mixed_reachability_families": mixed_families,
+        "executable_root_library_count": len(executable_roots),
+        "reachable_library_count": len(reachable),
+        "unreachable_library_count": len(unreachable),
+        "executable_root_libraries": sorted(executable_roots),
+        "reachable_libraries": sorted(reachable),
+        "unreachable_libraries": unreachable,
+        "dependency_cycle_count": len(cycles),
+        "dependency_cycles": cycles,
+        "mutual_dependency_pair_count": len(mutual_pairs),
+        "mutual_dependency_pairs": mutual_pairs,
+        "multi_library_cycle_count": sum(1 for cycle in cycles if len(cycle["libraries"]) > 2),
+        "multi_library_cycles": [cycle for cycle in cycles if len(cycle["libraries"]) > 2],
+        "libraries": libraries,
+    }
+
+
+def build_runtime_overlink_report(
+    dependency_report: dict,
+    search_paths: Sequence[str],
+    library_index: Dict[str, List[str]],
+) -> dict:
+    reachable = set(dependency_report.get("reachable_libraries", []))
+    entries = []
+
+    for item in dependency_report.get("libraries", []):
+        name = item["library"]
+        needed = set(item.get("needed_depends_on_internal", []))
+        actual = set(item.get("depends_on_internal", []))
+        redundant = sorted(needed - actual)
+        if redundant:
+            entries.append({
+                "library": name,
+                "reachable_from_executables": name in reachable,
+                "redundant_direct_dependencies": redundant,
+                "direct_needed_dependencies": sorted(needed),
+                "required_actual_dependencies": sorted(actual),
+            })
+
+    introducers: Dict[str, Set[str]] = {}
+    for entry in entries:
+        for dep in entry["redundant_direct_dependencies"]:
+            introducers.setdefault(dep, set()).add(entry["library"])
+
+    return {
+        "checked_library_count": dependency_report.get("discovered_library_count", 0),
+        "overlinked_library_count": len(entries),
+        "reachable_overlinked_library_count": sum(1 for entry in entries if entry["reachable_from_executables"]),
+        "total_redundant_dependency_edges": sum(len(entry["redundant_direct_dependencies"]) for entry in entries),
+        "redundant_dependency_introducer_count": len(introducers),
+        "redundant_dependency_introducers": {name: sorted(values) for name, values in sorted(introducers.items())},
+        "entries": sorted(entries, key=lambda entry: (not entry["reachable_from_executables"], -len(entry["redundant_direct_dependencies"]), entry["library"])),
+    }
+
+
+def build_symbol_provider_conflict_report(
+    executable_analyses: Sequence[dict],
+    search_paths: Sequence[str],
+    library_index: Dict[str, List[str]],
+) -> dict:
+    duplicate_records = []
+    conflict_index: Dict[Tuple[str, str, str], Dict[str, Set[str]]] = {}
+    total_records = 0
+
+    for item in executable_analyses:
+        executable_name = item["executable"]
+        analysis = item["analysis"]
+        linked = analysis.get("loaded_needed_libraries", [])
+        linked_symbol_indexes: Dict[str, Dict[str, List[dict]]] = {}
+
+        for lib_name in linked:
+            path = find_library_file(lib_name, search_paths, library_index)
+            if path:
+                linked_symbol_indexes[lib_name] = build_library_symbol_index(get_exported_symbols(path))
+
+        duplicates = []
+        for record in analysis.get("symbol_resolution_records", []):
+            total_records += 1
+            raw = record.get("symbol_raw") or record.get("symbol")
+            if should_ignore_symbol_for_report(raw):
+                continue
+            identity = parse_symbol_identity(raw)
+            providers = []
+            for lib_name, symbol_index in linked_symbol_indexes.items():
+                candidates = symbol_index.get(identity["name"], [])
+                if candidates and symbol_matches_any_export(identity, candidates):
+                    providers.append(lib_name)
+            providers = sorted(set(providers))
+            if len(providers) > 1:
+                duplicates.append({
+                    "symbol": identity["name"],
+                    "symbol_raw": raw,
+                    "providers": providers,
+                    "provider_count": len(providers),
+                    "consumers": [f"{record.get('consumer_type')}:{record.get('consumer')}"],
+                    "selected_providers": [record.get("selected_provider")] if record.get("selected_provider") else [],
+                })
+
+            key = (record.get("consumer_type", ""), record.get("consumer", ""), identity["name"])
+            provider = record.get("selected_provider")
+            if all(key) and provider:
+                conflict_index.setdefault(key, {}).setdefault(provider, set()).add(executable_name)
+
+        # 同一符号可能被多个 consumer record 重复加入。
+        unique_duplicates: Dict[Tuple[str, Tuple[str, ...]], dict] = {}
+        for duplicate in duplicates:
+            key = (duplicate["symbol_raw"], tuple(duplicate["providers"]))
+            unique_duplicates.setdefault(key, duplicate)
+
+        if unique_duplicates:
+            duplicate_records.append({
+                "executable": executable_name,
+                "linked_library_count": len(linked_symbol_indexes),
+                "linked_libraries": sorted(linked_symbol_indexes),
+                "used_symbol_count": len(analysis.get("symbol_resolution_records", [])),
+                "ignored_used_symbol_count": 0,
+                "multi_provider_used_symbol_count": len(unique_duplicates),
+                "multi_provider_used_symbols": sorted(unique_duplicates.values(), key=lambda value: (-value["provider_count"], value["symbol"])),
+                "duplicate_symbol_count": len(unique_duplicates),
+                "duplicate_symbols": sorted(unique_duplicates.values(), key=lambda value: (-value["provider_count"], value["symbol"])),
+            })
+
+    cross_conflicts = []
+    for (consumer_type, consumer, symbol), providers in sorted(conflict_index.items()):
+        if len(providers) <= 1:
+            continue
+        cross_conflicts.append({
+            "consumer_type": consumer_type,
+            "consumer": consumer,
+            "symbol": symbol,
+            "provider_count": len(providers),
+            "providers": [
+                {
+                    "provider": provider,
+                    "executables": sorted(executables),
+                    "executable_count": len(executables),
+                }
+                for provider, executables in sorted(providers.items())
+            ],
+        })
+
+    return {
+        "scanned_executable_count": len(executable_analyses),
+        "executables_with_multi_provider_used_symbols_count": len(duplicate_records),
+        "multi_provider_used_symbol_count_total": sum(item["multi_provider_used_symbol_count"] for item in duplicate_records),
+        "duplicate_symbol_records": sorted(duplicate_records, key=lambda item: (-item["duplicate_symbol_count"], item["executable"])),
+        "symbol_resolution_record_count": total_records,
+        "cross_executable_provider_conflict_count": len(cross_conflicts),
+        "cross_executable_provider_conflicts": cross_conflicts,
+        "executables_with_duplicate_symbols_count": len(duplicate_records),
+        "duplicate_symbol_count_total": sum(item["duplicate_symbol_count"] for item in duplicate_records),
+    }
+
+
+# -----------------------------------------------------------------------------
+# 打印报告
+# -----------------------------------------------------------------------------
+
+def print_symbol_provider_conflict_report(report: dict, verbose: bool) -> None:
+    print("\n" + "=" * 80)
+    print("符号提供者冲突分析")
+    print("=" * 80)
+    print(f"  • 扫描可执行文件数: {report['scanned_executable_count']}")
+    print(f"  • 记录的符号解析条目数: {report['symbol_resolution_record_count']}")
+    print(f"  • 存在已使用符号多提供者的可执行文件数: {report['executables_with_multi_provider_used_symbols_count']}")
+    print(f"  • 跨可执行文件提供者冲突条目数: {report['cross_executable_provider_conflict_count']}")
+
+    if verbose:
+        for item in report.get("duplicate_symbol_records", []):
+            print(f"\n  {item['executable']}: 多提供者符号 {item['multi_provider_used_symbol_count']} 个")
+            for symbol in item["multi_provider_used_symbols"][:50]:
+                print(f"    - {symbol['symbol']} <- {', '.join(symbol['providers'])}")
+
+
+def print_library_reference_stats(stats: dict, verbose: bool) -> None:
+    print("\n" + "=" * 80)
+    print("库引用关系统计（基于动态强符号关系）")
+    print("=" * 80)
+    print(f"  • 目录中发现的库总数: {stats['discovered_library_count']}")
+    print(f"  • 目录中未被引用的库: {stats['discovered_unreferenced_library_count']}")
+    print(f"  • 被可执行文件引用的库: {stats['libraries_with_executable_refs']}")
+    print(f"  • 被其他库引用的库: {stats['libraries_with_library_refs']}")
+    print(f"  • 总引用关系数: {stats['total_reference_count']}")
+
+    if verbose:
+        for item in stats["libraries"]:
+            if item["total_ref_count"] == 0:
+                continue
+            print(f"\n  {item['library']}:")
+            if item["executables"]:
+                print(f"    可执行文件: {', '.join(item['executables'])}")
+            if item["libraries"]:
+                print(f"    库文件: {', '.join(item['libraries'])}")
+
+        print("\n  未被引用库候选:")
+        for name in stats["discovered_unreferenced_libraries"]:
+            print(f"    - {name}")
+
+
+def print_library_dependency_report(report: dict, verbose: bool) -> None:
+    print("\n" + "=" * 80)
+    print("库相互依赖检查")
+    print("=" * 80)
+    print(f"  • 目录库总数: {report['discovered_library_count']}")
+    print(f"  • 库间依赖边数（实际符号）: {report['dependency_edge_count']}")
+    print(f"  • 库间依赖边数（NEEDED）: {report['needed_dependency_edge_count']}")
+    print(f"  • 可执行文件根库数: {report['executable_root_library_count']}")
+    print(f"  • 从可执行文件可达的库: {report['reachable_library_count']}")
+    print(f"  • 从可执行文件不可达的库: {report['unreachable_library_count']}")
+    print(f"  • 双向相互依赖对数: {report['mutual_dependency_pair_count']}")
+    print(f"  • 循环依赖组数: {report['dependency_cycle_count']}")
+
+    if verbose:
+        print("\n  可执行文件根库:")
+        for name in report["executable_root_libraries"]:
+            print(f"    - {name}")
+        print("\n  不可达库候选:")
+        for name in report["unreachable_libraries"]:
+            print(f"    - {name}")
+        print("\n  循环依赖:")
+        for cycle in report["dependency_cycles"]:
+            print(f"    - {', '.join(cycle['libraries'])}")
+
+
+def print_runtime_overlink_report(report: dict, verbose: bool) -> None:
+    print("\n" + "=" * 80)
+    print("库级冗余链接风险")
+    print("=" * 80)
+    print(f"  • 检查的库总数: {report['checked_library_count']}")
+    print(f"  • 存在冗余链接的库数: {report['overlinked_library_count']}")
+    print(f"  • 冗余依赖边总数: {report['total_redundant_dependency_edges']}")
+
+    if verbose:
+        for entry in report["entries"]:
+            print(f"  - {entry['library']}: {', '.join(entry['redundant_direct_dependencies'])}")
+
+
+# -----------------------------------------------------------------------------
+# 单库与目录扫描
+# -----------------------------------------------------------------------------
+
+def resolve_single_library(root_dir: str, lib_arg: str, library_index: Dict[str, List[str]]) -> Optional[str]:
+    if os.path.isfile(lib_arg):
+        return dereference_symlink(lib_arg)
+
+    joined = os.path.join(root_dir, lib_arg.lstrip("/"))
+    if os.path.isfile(joined):
+        return dereference_symlink(joined)
+
+    return find_library_file(os.path.basename(lib_arg), [root_dir], library_index)
+
+
+def build_single_library_report(
+    path: str,
+    search_paths: Sequence[str],
+    library_index: Dict[str, List[str]],
+) -> dict:
+    groups = get_undefined_symbol_groups(path)
+    needed = get_library_dependencies(path)
+
+    required_providers, required_missing = resolve_symbol_providers(
+        groups["required"], needed, search_paths, library_index, include_all_fallback=True
+    )
+    weak_providers, weak_missing = resolve_symbol_providers(
+        groups["weak"], needed, search_paths, library_index, include_all_fallback=True
+    )
+
+    direct_actual = {
+        normalize_library_name(provider, search_paths, library_index)
+        for providers in required_providers.values()
+        for provider in providers
+    }
+    indirect_actual = build_actual_closure(direct_actual, search_paths, library_index) - direct_actual
+    actual_all = direct_actual | indirect_actual
+
+    corrected_needed = {
+        normalize_library_name(dep, search_paths, library_index)
+        for dep in needed
+        if find_library_file(dep, search_paths, library_index)
+    }
+
+    return {
+        "mode": "single",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "input_library_path": path,
+        "resolved_library_path": dereference_symlink(path),
+        "search_paths": list(search_paths),
+        "valid": True,
+        "validation_message": "文件有效",
+        "readelf_dependencies": sorted(set(needed)),
+        "undefined_symbol_count": len(groups["required"]) + len(groups["weak"]),
+        "required_undefined_symbol_count": len(groups["required"]),
+        "weak_undefined_symbol_count": len(groups["weak"]),
+        "required_resolved_symbol_count": len(required_providers),
+        "weak_resolved_symbol_count": len(weak_providers),
+        "required_missing_symbol_count": len(required_missing),
+        "weak_missing_symbol_count": len(weak_missing),
+        "required_missing_symbols": sorted(required_missing),
+        "weak_missing_symbols": sorted(weak_missing),
+        "required_symbol_providers_by_symbol": {key: sorted(value) for key, value in sorted(required_providers.items())},
+        "weak_symbol_providers_by_symbol": {key: sorted(value) for key, value in sorted(weak_providers.items())},
+        "direct_used_libraries": sorted(direct_actual),
+        "indirect_used_libraries": sorted(indirect_actual),
+        "all_actual_used_libraries": sorted(actual_all),
+        "corrected_common_libraries": sorted(corrected_needed & actual_all),
+        "corrected_only_in_readelf": sorted(corrected_needed - actual_all),
+        "corrected_only_in_actual": sorted(actual_all - corrected_needed),
+    }
+
+
+def print_single_library_report(report: dict) -> None:
+    print("\n" + "=" * 80)
+    print(f"单库分析: {report['resolved_library_path']}")
+    print("=" * 80)
+    print(f"  • DT_NEEDED: {len(report['readelf_dependencies'])} 个")
+    print(f"  • 必须未定义符号: {report['required_undefined_symbol_count']} 个")
+    print(f"  • 已解析必须符号: {report['required_resolved_symbol_count']} 个")
+    print(f"  • 未解析必须符号: {report['required_missing_symbol_count']} 个")
+    print(f"  • 实际所需库: {len(report['all_actual_used_libraries'])} 个")
+    print(f"  • NEEDED 但强符号未使用候选: {len(report['corrected_only_in_readelf'])} 个")
+
+    print("\n  DT_NEEDED:")
+    for name in report["readelf_dependencies"]:
+        print(f"    - {name}")
+    print("\n  实际所需库:")
+    for name in report["all_actual_used_libraries"]:
+        print(f"    - {name}")
+    print("\n  NEEDED 但未发现强符号使用:")
+    for name in report["corrected_only_in_readelf"]:
+        print(f"    - {name}")
+    if report["required_missing_symbols"]:
+        print("\n  未解析必须符号:")
+        for symbol in report["required_missing_symbols"]:
+            print(f"    - {symbol}")
+
+
+def scan_directory(directory_path: str, verbose: bool) -> dict:
+    root = os.path.abspath(directory_path)
+    search_paths = [root]
+    library_index = build_library_index(search_paths)
+    all_library_paths = sorted({path for paths in library_index.values() for path in paths})
+    executables = find_all_executables_in_path(root)
+
+    if verbose:
+        print(f"扫描目录: {root}")
+        print(f"发现 ELF 可执行文件: {len(executables)}")
+        print(f"发现共享库真实文件: {len(all_library_paths)}")
+
+    executable_analyses = []
+    findings = []
+
+    for executable in executables:
+        analysis = analyze_executable(executable, search_paths, library_index, verbose=verbose)
+        item = {
+            "executable": os.path.basename(executable),
+            "path": executable,
+            "analysis": analysis,
+        }
+        executable_analyses.append(item)
+        if analysis["unused_libs"]:
+            findings.append({
+                "executable": os.path.basename(executable),
+                "path": executable,
+                "readelf_deps": analysis["readelf_direct_libraries"],
+                "direct_needed_libraries": analysis["direct_needed_libraries"],
+                "indirect_needed_libraries": analysis["indirect_needed_libraries"],
+                "actual_required_libraries": analysis["actual_required_libraries"],
+                "direct_unused_libs": analysis["direct_unused_libs"],
+                "indirect_unused_libs": analysis["indirect_unused_libs"],
+                "indirect_unused_introducers": analysis["indirect_unused_introducers"],
+                "unused_libs": analysis["unused_libs"],
+                "missing_symbols": analysis["missing_symbols"],
+            })
+
+    # 即使某个库没有被可执行文件路径遍历到，也分析库到库引用关系。
+    for path in all_library_paths:
+        actual_dependencies_for_consumer(
+            path,
+            search_paths,
+            library_index,
+            top_level_deps=get_library_dependencies(path),
+            record_references=True,
+            is_executable=False,
+        )
+
+    conflict_report = build_symbol_provider_conflict_report(executable_analyses, search_paths, library_index)
+    reference_stats = get_library_reference_stats(all_library_paths)
+    dependency_report = build_library_dependency_report(executables, all_library_paths, search_paths, library_index)
+    overlink_report = build_runtime_overlink_report(dependency_report, search_paths, library_index)
+
+    unique_unused = sorted({name for finding in findings for name in finding["unused_libs"]})
+    report = {
+        "mode": "scan",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "directory_path": root,
+        "search_paths": search_paths,
+        "verbose": verbose,
+        "scanned_executable_count": len(executables),
+        "executables_with_unused_libs_count": len(findings),
+        "findings": sorted(findings, key=lambda item: (-len(item["unused_libs"]), item["executable"])),
+        "total_unused_library_links": sum(len(item["unused_libs"]) for item in findings),
+        "unique_unused_libraries": unique_unused,
+        "symbol_provider_conflict_report": conflict_report,
+        "library_reference_stats": reference_stats,
+        "library_dependency_report": dependency_report,
+        "runtime_overlink_report": overlink_report,
+    }
+
+    print_symbol_provider_conflict_report(conflict_report, verbose)
+    print_library_reference_stats(reference_stats, verbose)
+    print_library_dependency_report(dependency_report, verbose)
+    print_runtime_overlink_report(overlink_report, verbose)
+
+    print("\n" + "=" * 80)
+    print("扫描结论")
+    print("=" * 80)
+    print(f"  • 可执行文件: {len(executables)}")
+    print(f"  • 存在 NEEDED/强符号差异的可执行文件: {len(findings)}")
+    print(f"  • 去重后的未使用链接候选库: {len(unique_unused)}")
+    print("  • 注意：候选库不能直接删除，必须继续做 dlopen/配置引用和样机运行时验证。")
+
+    return report
+
+
+# -----------------------------------------------------------------------------
+# 主函数
+# -----------------------------------------------------------------------------
+
+def main() -> int:
+    try:
+        args = parse_cli_arguments(sys.argv[1:])
+    except ValueError as exc:
+        print(f"错误: {exc}")
+        print_usage()
+        return 1
+
+    if args.get("show_help"):
+        print_usage()
+        return 0
+
+    ok, missing = check_required_commands()
+    if not ok:
+        print(f"错误: 缺少外部命令: {', '.join(missing)}")
+        return 2
+
+    clear_cache()
+    report: dict
+
+    if args["mode"] == "scan":
+        directory = args["directory_path"]
+        if not os.path.isdir(directory):
+            print(f"错误: 目录不存在: {directory}")
+            return 1
+        report = scan_directory(directory, args.get("verbose", False))
+        report["fail_on_unused"] = args.get("fail_on_unused", False)
+    else:
+        root = os.path.abspath(args["root_dir"])
+        if not os.path.isdir(root):
+            print(f"错误: 根目录不存在: {root}")
+            return 1
+        search_paths = [root]
+        library_index = build_library_index(search_paths)
+        path = resolve_single_library(root, args["lib_path"], library_index)
+        if not path:
+            print(f"错误: 找不到库: {args['lib_path']}")
+            return 1
+        report = build_single_library_report(path, search_paths, library_index)
+        print_single_library_report(report)
+
+    json_path = args.get("json_report_path")
+    if json_path:
+        success, result = write_json_report(report, json_path)
+        if not success:
+            print(f"JSON 报告写入失败: {result}")
+            return 1
+        print(f"\nJSON 报告已写入: {result}")
+
+    if (
+        args["mode"] == "scan"
+        and args.get("fail_on_unused")
+        and report.get("executables_with_unused_libs_count", 0) > 0
+    ):
+        return 3
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
