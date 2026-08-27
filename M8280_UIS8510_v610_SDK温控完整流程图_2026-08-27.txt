@@ -1,0 +1,717 @@
+M8280 / UIS8510 / v610 SDK 温控完整流程图
+日期：2026-08-27
+
+===============================================================================
+一、系统启动与温控初始化
+===============================================================================
+
+                                系统上电
+                                   │
+                                   ▼
+                           Linux Kernel 启动
+                                   │
+                                   ▼
+                              解析 Thermal DTS
+                                   │
+          ┌────────────────────────┼────────────────────────┐
+          │                        │                        │
+          ▼                        ▼                        ▼
+     充电温度通道              NR 温度通道             AP/SoC 温度通道
+          │                        │                        │
+          ▼                        ▼                        ▼
+  chg_thermistor             ap_thm1 sensor6          core0~core7
+          │                        │                    + GPU thermal zone
+          ▼                        ▼                        │
+UMP9651 PMIC ADC4       SoC THM1 Controller               │
+          │                        │                        │
+          ▼                        ▼                        │
+sprd_pmic_adc.c        sprd_thm_r5p0.c                    │
+          │                        │                        │
+          │                读取 sensor6 raw data            │
+          │                        │                        │
+          │                读取 NVMEM/eFuse 校准             │
+          │                ├─ thm1_ratio                    │
+          │                └─ thm1_sen6                     │
+          │                        │                        │
+          │                计算 cal_slope / cal_offset      │
+          │                        │                        │
+          │                raw → 实际温度（m℃）              │
+          │                        │                        │
+          ▼                        ▼                        ▼
+ Linux IIO Framework          nr-thmzone            sprd_soc_thermal.c
+          │                        │                        │
+          ▼                        │                  virtual_sensor
+thermal-generic-adc.c              │                        │
+          │                        │                  读取 core0~7 + GPU
+读取 ADC processed value           │                        │
+          │                        │                  取所有温度最大值
+          ▼                        │                        ▼
+读取 DTS                           │                   soc-thmzone
+temperature-lookup-table           │
+          │                        │
+线性插值换算温度                   │
+          │                        │
+          ▼                        │
+     chg-thmzone                   │
+          │                        │
+          └──────────────┬─────────┘
+                         ▼
+                 Linux Thermal Framework
+                         │
+                         ▼
+         统一通过 /sys/class/thermal/thermal_zoneX
+                    暴露 type / temp
+
+
+===============================================================================
+二、THM 底层硬件保护初始化
+===============================================================================
+
+sprd_thm_r5p0.c
+        │
+        ▼
+读取 THM IP_VERSION 寄存器
+        │
+        ▼
+实机确认：
+THM0 = 0x0500
+THM1 = 0x0500
+        │
+        ▼
+按当前机型实际硬件逻辑初始化 THM 阈值
+        │
+        ├─────────────────────┐
+        │                     │
+        ▼                     ▼
+   75℃ HOT               120℃ OTP
+   threshold              threshold
+        │                     │
+        ▼                     ▼
+ THM 硬件高温告警        THM 最底层极限过温保护阈值
+
+说明：
+- 当前机型 THM0 / THM1 实机版本均为 0x0500。
+- 120℃ OTP 阈值已由当前 Kernel driver 源码确认。
+- 厂商资料将 120℃描述为 Hardware Shutdown；
+  当前源码分析已确认 120℃硬件阈值，最终硬件内部断电动作未继续下钻。
+
+
+===============================================================================
+三、OpenWrt 用户空间温控启动
+===============================================================================
+
+Kernel Thermal 初始化完成
+        │
+        ▼
+OpenWrt init / procd
+        │
+        ▼
+/etc/init.d/cthermald
+源码：
+quectel/unisoc/service/module/thermal2/files/cthermald.init
+        │
+        │ START=21
+        │
+        ├───────────────────────────────────────────┐
+        │                                           │
+        ▼                                           ▼
+先执行                                         再启动
+/usr/bin/thermal_enable.sh                    /usr/bin/cthermald
+        │                                           │
+        ▼                                           ▼
+【AP/SoC Kernel 温控开启】                 【用户态产品温控】
+        │                                           │
+        ▼                                           ▼
+读取 /etc/config/thermal                  读取温控策略文件
+        │                                           │
+        ▼                            ┌──────────────┴──────────────┐
+读取 thermal.ap.enable              │                             │
+        │                            ▼                             ▼
+        │                    /etc/thm_cfg_0.ini            /etc/thm_cfg_1.ini
+        │                        充电温控                       NR/RF 温控
+        │
+        ├─ enable != 1
+        │      │
+        │      └─ thermal_enable.sh 结束
+        │         （不影响后续 cthermald 启动）
+        │
+        └─ enable = 1
+               │
+               ▼
+       遍历 thermal_zone*/type
+               │
+               ▼
+          找到 soc-thmzone
+               │
+               ▼
+         写入 soc-thmzone：
+         policy = power_allocator
+         thm_enable = 1
+               │
+               ▼
+       开启 AP Kernel 动态温控
+
+
+===============================================================================
+四、cthermald 主程序初始化
+===============================================================================
+
+/usr/bin/cthermald
+源码：
+quectel/unisoc/service/module/thermal2/src/thmmonitor.c
+        │
+        ▼
+依次读取：
+/etc/thm_cfg_0.ini
+/etc/thm_cfg_1.ini
+        │
+        ▼
+sen_init()
+        │
+        ├─ 读取监控 thermal zone 名称
+        ├─ 读取 ctrl
+        ├─ 读取 polling
+        ├─ 读取 hot_polling
+        ├─ 读取各 Level 温度阈值
+        └─ 读取各 Level 对应执行动作
+        │
+        ▼
+type_match()
+        │
+        ▼
+遍历：
+/sys/class/thermal/thermal_zone*/type
+        │
+        ├──────────────────────────┐
+        │                          │
+        ▼                          ▼
+找到 chg-thmzone              找到 nr-thmzone
+        │                          │
+        ▼                          ▼
+保存对应 temp 路径            保存对应 temp 路径
+        │                          │
+        └─────────────┬────────────┘
+                      ▼
+                 启动监控线程
+                      │
+                      ▼
+             周期读取 thermal temp
+
+同时启动：
+chg_uevent_listener()
+        │
+        ▼
+监听 power_supply uevent
+        │
+        ▼
+读取并更新：
+/sys/class/power_supply/battery/status
+
+
+===============================================================================
+五、支路 A：充电温控
+===============================================================================
+
+配置文件：
+/etc/thm_cfg_0.ini
+        │
+        ▼
+监控对象：
+chg-thmzone
+        │
+        ▼
+温度采集链：
+
+板级充电区域热敏器件
+        │
+        ▼
+UMP9651 PMIC ADC channel 4
+        │
+        ▼
+sprd_pmic_adc.c
+        │
+        ▼
+Linux IIO Framework
+        │
+        ▼
+iio_read_channel_processed()
+        │
+        ▼
+thermal-generic-adc.c
+        │
+        ▼
+读取 DTS temperature-lookup-table
+        │
+        ▼
+线性插值换算为温度（m℃）
+        │
+        ▼
+chg-thmzone
+        │
+        ▼
+/sys/class/thermal/thermal_zoneX/temp
+        │
+        ▼
+cthermald 读取温度
+        │
+        ▼
+同时读取：
+/sys/class/power_supply/battery/status
+        │
+        ├─ 非 Charging / Full
+        │      │
+        │      └─ 不执行充电温控动作
+        │
+        └─ Charging / Full
+               │
+               ▼
+             判断温度
+               │
+         ┌─────┴──────────────────────┐
+         │                            │
+         ▼                            ▼
+    正常 / 低温                  温度 >= 55℃
+         │                            │
+         ▼                            ▼
+写 battery/                    写 battery/
+charge_control_limit           charge_control_limit
+         │                            │
+         ▼                            ▼
+       18000                         5000
+         │                            │
+         ▼                            ▼
+    正常充电能力                   限制充电能力
+                                      │
+                                      ▼
+                               减少充电产生的热量
+                                      │
+                                      ▼
+                               温度降至约 52℃以下
+                                      │
+                                      ▼
+                              恢复 charge_control_limit
+                                      │
+                                      ▼
+                                    18000
+
+轮询周期：
+- 正常状态：10 秒
+- 高温状态：3 秒
+
+
+===============================================================================
+六、支路 B：NR / RF 温控
+===============================================================================
+
+配置文件：
+/etc/thm_cfg_1.ini
+        │
+        ▼
+监控对象：
+nr-thmzone
+        │
+        ▼
+温度采集链：
+
+SoC 内部 THM1 sensor6
+        │
+        ▼
+sprd_thm_r5p0.c
+        │
+        ▼
+读取 THM1 sensor6 raw data
+        │
+        ▼
+读取 NVMEM/eFuse：
+├─ thm1_ratio
+└─ thm1_sen6
+        │
+        ▼
+计算：
+cal_slope
+cal_offset
+        │
+        ▼
+raw data → 实际温度（m℃）
+        │
+        ▼
+nr-thmzone
+        │
+        ▼
+/sys/class/thermal/thermal_zoneX/temp
+        │
+        ▼
+cthermald 读取温度
+        │
+        ▼
+按当前温度选择对应 Level
+        │
+        ├─ 正常状态 / < 98℃
+        │      ↓
+        │   AT+SPTPPB=0
+        │
+        ├─ >= 98℃
+        │      ↓
+        │   AT+SPTPPB=2
+        │
+        ├─ >= 100℃
+        │      ↓
+        │   AT+SPTPPB=4
+        │
+        ├─ >= 102℃
+        │      ↓
+        │   AT+SPTPPB=6
+        │
+        ├─ >= 104℃
+        │      ↓
+        │   AT+SPTPPB=8
+        │
+        └─ >= 105℃
+               ↓
+           AT+SPTPPB=10
+               │
+               ▼
+           md_action()
+               │
+               ▼
+         quec_atc_send()
+               │
+               ▼
+            Modem FW
+               │
+               ▼
+       NR/RF 发射能力逐级回退
+               │
+               ▼
+          降低射频发热
+
+Level1 回滞温度：
+96℃
+
+轮询周期：
+- 正常状态：10 秒
+- 高温状态：3 秒
+
+重要数据方向：
+
+THM1 sensor6 测温
+        ↓
+Linux Kernel 得到 nr 温度
+        ↓
+cthermald 判断
+        ↓
+AT+SPTPPB=N
+        ↓
+Modem 执行 RF 功率限制
+
+AT 是控制输出，不是温度输入。
+
+
+===============================================================================
+七、支路 C：AP / CPU / GPU 动态温控
+===============================================================================
+
+CPU0 thermal zone ─┐
+CPU1 thermal zone  │
+CPU2 thermal zone  │
+CPU3 thermal zone  │
+CPU4 thermal zone  ├────────→ virtual_sensor
+CPU5 thermal zone  │               │
+CPU6 thermal zone  │               │
+CPU7 thermal zone  │               │
+GPU thermal zone ──┘               │
+                                   ▼
+                         sprd_soc_thermal.c
+                                   │
+                                   ▼
+                      读取 core0~7 + GPU 温度
+                                   │
+                                   ▼
+                           取所有温度最大值
+                                   │
+                                   ▼
+                              soc-thmzone
+                                   │
+                                   ▼
+                     Linux Thermal Framework
+                                   │
+                                   ▼
+                        policy = power_allocator
+                        thm_enable = 1
+                                   │
+                                   ▼
+                         按 DTS thermal trip 判断
+
+
+                          ┌────────┼─────────┐
+                          │        │         │
+                          ▼        ▼         ▼
+                        70℃      85℃      105℃
+                      passive   passive      hot
+                          │        │         │
+                          └───┬────┘         │
+                              │              │
+                              ▼              │
+                    power_allocator / PID     │
+                              │              │
+                              ▼              │
+                       计算允许功率预算        │
+                              │              │
+                              ▼              │
+                      分配给 cooling devices   │
+                              │
+                 ┌────────────┴────────────┐
+                 │                         │
+                 ▼                         ▼
+          cpufreq cooling             thermal-cpu
+                 │                         │
+                 └────────────┬────────────┘
+                              │
+                              ▼
+                      CPU/GPU 动态限功耗
+                      CPU 降频等冷却措施
+
+说明：
+- 70℃ / 85℃：AP 动态性能温控阶段。
+- 105℃：Linux Thermal Framework 的 HOT trip。
+- 105℃不是当前实机 THM 硬件保护阈值。
+
+
+===============================================================================
+八、AP 极端高温：115℃软件关机
+===============================================================================
+
+CPU / GPU 温度
+        │
+        ▼
+virtual_sensor 取最高值
+        │
+        ▼
+soc-thmzone
+        │
+        ▼
+温度 >= 115℃
+        │
+        ▼
+DTS trip：
+type = "critical"
+        │
+        ▼
+Linux Thermal Core
+drivers/thermal/thermal_core.c
+        │
+        ▼
+handle_critical_trips()
+        │
+        ▼
+THERMAL_TRIP_CRITICAL
+        │
+        ▼
+thermal_zone_device_critical()
+        │
+        ▼
+hw_protection_shutdown(
+    "Temperature too high",
+    poweroff_delay_ms
+)
+        │
+        ▼
+Linux 软件过温关机保护
+
+结论：
+115℃ = AP / Linux 软件级过温关机点。
+
+
+===============================================================================
+九、当前机型最终温控措施总览
+===============================================================================
+
+【1. 充电温控】
+
+板级热敏器件
+    ↓
+UMP9651 ADC4
+    ↓
+chg-thmzone
+    ↓
+cthermald
+    ↓
+55℃
+    ↓
+charge_control_limit
+18000 → 5000
+    ↓
+充电限流
+    ↓
+降低充电发热
+
+
+【2. NR / RF 温控】
+
+THM1 sensor6
+    ↓
+nr-thmzone
+    ↓
+cthermald
+    ↓
+98 / 100 / 102 / 104 / 105℃
+    ↓
+AT+SPTPPB
+0 → 2 → 4 → 6 → 8 → 10
+    ↓
+Modem RF 功率逐级回退
+    ↓
+降低射频发热
+
+
+【3. AP / CPU / GPU 动态温控】
+
+CPU0~7 + GPU
+    ↓
+virtual_sensor 取最高温
+    ↓
+soc-thmzone
+    ↓
+70℃ / 85℃ passive
+    ↓
+power_allocator / PID
+    ↓
+cooling devices
+    ↓
+CPU/GPU 限功耗、CPU 降频等
+    ↓
+降低 AP 发热
+
+
+【4. AP 软件极限保护】
+
+soc-thmzone
+    ↓
+115℃ critical
+    ↓
+Linux Thermal Core
+    ↓
+hw_protection_shutdown()
+    ↓
+软件关机
+
+
+【5. THM 底层硬件保护】
+
+THM0 / THM1
+    ↓
+实机 IP_VERSION = 0x0500
+    ↓
+75℃ HOT threshold
+120℃ OTP threshold
+    ↓
+SoC THM 最底层硬件过温保护
+
+
+===============================================================================
+十、完整总流程
+===============================================================================
+
+                                系统上电
+                                   │
+                                   ▼
+                           Linux Kernel 启动
+                                   │
+                                   ▼
+                       DTS 建立各温度采集通道
+                                   │
+          ┌────────────────────────┼─────────────────────────┐
+          │                        │                         │
+          ▼                        ▼                         ▼
+  chg_thermistor             THM1 sensor6             CPU0~7 + GPU
+          │                        │                         │
+          ▼                        ▼                         ▼
+ UMP9651 ADC4             sprd_thm_r5p0.c          各 thermal zone
+          │                        │                         │
+          ▼                        ▼                         ▼
+generic-adc-thermal           nr-thmzone             virtual_sensor
+          │                        │                         │
+          ▼                        │                         ▼
+     chg-thmzone                   │                    取最高温
+          │                        │                         │
+          │                        │                         ▼
+          │                        │                    soc-thmzone
+          │                        │                         │
+          │                        │                         │
+          │                        │                 Kernel 动态温控
+          │                        │                         │
+          │                        │                 70℃ / 85℃ passive
+          │                        │                         │
+          │                        │                         ▼
+          │                        │             power_allocator / PID
+          │                        │                         │
+          │                        │                         ▼
+          │                        │                CPU/GPU 动态降功耗
+          │                        │                         │
+          │                        │                         ▼
+          │                        │                     105℃ HOT
+          │                        │                         │
+          │                        │                         ▼
+          │                        │                    115℃ critical
+          │                        │                         │
+          │                        │                         ▼
+          │                        │              hw_protection_shutdown
+          │                        │                         │
+          │                        │                         ▼
+          │                        │                      软件关机
+          │                        │
+          │                        │
+          └──────────────┬─────────┘
+                         │
+                         ▼
+                 OpenWrt 用户空间启动
+                         │
+                         ▼
+                /etc/init.d/cthermald
+                         │
+              ┌──────────┴──────────┐
+              │                     │
+              ▼                     ▼
+     thermal_enable.sh          /usr/bin/cthermald
+              │                     │
+              ▼                     ▼
+读取 /etc/config/thermal       读取：
+              │                /etc/thm_cfg_0.ini
+              ▼                /etc/thm_cfg_1.ini
+thermal.ap.enable                   │
+              │                     ├──────────────────┐
+              ▼                     │                  │
+开启 soc-thmzone                   ▼                  ▼
+power_allocator               充电温控             NR/RF温控
+                                    │                  │
+                                    ▼                  ▼
+                               chg-thmzone         nr-thmzone
+                                    │                  │
+                                    ▼                  ▼
+                              检查 battery/status    读取温度
+                                    │                  │
+                                    ▼                  ▼
+                               Charging/Full        >=98℃
+                                    │                  │
+                                    ▼                  ▼
+                                  >=55℃          AT+SPTPPB逐级增加
+                                    │                  │
+                                    ▼                  ▼
+                           charge_control_limit     Modem RF回退
+                           18000 → 5000               │
+                                    │                  │
+                                    ▼                  ▼
+                                 充电限流            降低RF发热
+
+
+同时，Kernel 初始化 THM 底层硬件保护：
+        │
+        ▼
+THM0 / THM1 IP_VERSION = 0x0500
+        │
+        ├─ 75℃ HOT threshold
+        │
+        └─ 120℃ OTP threshold
+                │
+                ▼
+          最底层硬件过温保护
